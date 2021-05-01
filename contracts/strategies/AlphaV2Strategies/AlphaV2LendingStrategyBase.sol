@@ -8,6 +8,7 @@ import "OpenZeppelin/openzeppelin-contracts@3.4.0/contracts/utils/Address.sol";
 import "OpenZeppelin/openzeppelin-contracts@3.4.0/contracts/token/ERC20/SafeERC20.sol";
 import "../../../interfaces/strategies/AlphaV2Strategies/IAlphaV2.sol";
 import "../../../interfaces/strategies/AlphaV2Strategies/ICErc20.sol";
+import "../../../interfaces/uniswap/IUniswapV2Router02.sol";
 import "../../../interfaces/IFund.sol";
 import "../../../interfaces/IStrategy.sol";
 import "../../../interfaces/IGovernable.sol";
@@ -15,54 +16,67 @@ import "../../../interfaces/IGovernable.sol";
 /**
  * This strategy takes an asset (DAI, USDC), lends to AlphaV2 Lending Box.
  */
-contract AlphaV2LendingStrategyBase is IStrategy {
-    enum TokenIndex {DAI, USDC}
-
+abstract contract AlphaV2LendingStrategyBase is IStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
 
-    address public override underlying;
-    address public override fund;
-    address public override creator;
-
-    // the matching enum record used to determine the index
-    TokenIndex tokenIndex;
+    address public immutable override underlying;
+    address public immutable override fund;
+    address public immutable override creator;
 
     // the alphasafebox corresponding to the underlying asset
-    address public aBox;
+    address public immutable aBox;
+
+    // the cToken corresponding to the alphasafebox
+    address public immutable cToken;
+
+    // Alpha token as rewards
+    address public constant rewardToken = address(0xa1faa113cbE53436Df28FF0aEe54275c13B40975);
+
+    // Uniswap V2s router to liquidate Alpha rewards to underlying
+    address internal constant _uniswapRouter = address(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+
+    // WETH serves as path to convert rewards to underlying
+    address internal constant WETH = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
 
     // these tokens cannot be claimed by the governance
     mapping(address => bool) public canNotSweep;
 
     bool public investActivated;
 
-    constructor(
-        address _fund,
-        address _aBox,
-        uint256 _tokenIndex
-    ) public {
+    constructor(address _fund, address _aBox) public {
         require(_fund != address(0), "Fund cannot be empty");
+        require(_aBox != address(0), "Alpha Safebox cannot be empty");
         fund = _fund;
-        underlying = IFund(fund).underlying();
-        tokenIndex = TokenIndex(_tokenIndex);
+        address _underlying = IFund(_fund).underlying();
+        require(
+            _underlying == IAlphaV2(_aBox).uToken(),
+            "Underlying do not match"
+        );
+        underlying = _underlying;
         aBox = _aBox;
+        cToken = IAlphaV2(_aBox).cToken();
         creator = msg.sender;
 
+        // approve max amount to save on gas costs later
+        IERC20(_underlying).safeApprove(_aBox, type(uint256).max);
+
         // restricted tokens, can not be swept
-        canNotSweep[underlying] = true;
-        canNotSweep[aBox] = true;
+        canNotSweep[_underlying] = true;
+        canNotSweep[_aBox] = true;
+        canNotSweep[rewardToken] = true;
 
         investActivated = true;
     }
 
-    function governance() internal view returns (address) {
+    function _governance() internal view returns (address) {
         return IGovernable(fund).governance();
     }
 
     modifier onlyFundOrGovernance() {
         require(
-            msg.sender == fund || msg.sender == governance(),
+            msg.sender == fund || msg.sender == _governance(),
             "The sender has to be the governance or fund"
         );
         _;
@@ -113,9 +127,16 @@ contract AlphaV2LendingStrategyBase is IStrategy {
         }
 
         uint256 shares =
-            shareValueFromUnderlying(
+            _shareValueFromUnderlying(
                 underlyingAmount.sub(underlyingBalanceBefore)
             );
+        uint256 totalShares = IAlphaV2(aBox).balanceOf(address(this));
+
+        if (shares > totalShares) {
+            //can't withdraw more than we have
+            shares = totalShares;
+        }
+
         IAlphaV2(aBox).withdraw(shares);
 
         // we can transfer the asset to the fund
@@ -143,15 +164,13 @@ contract AlphaV2LendingStrategyBase is IStrategy {
     /**
      * Invests all underlying assets into our Alpha V2 Lending Box.
      */
-    function investAllUnderlying() internal {
+    function _investAllUnderlying() internal {
         if (!investActivated) {
             return;
         }
 
         uint256 underlyingBalance = IERC20(underlying).balanceOf(address(this));
         if (underlyingBalance > 0) {
-            IERC20(underlying).safeApprove(aBox, 0);
-            IERC20(underlying).safeApprove(aBox, underlyingBalance);
             // deposits the entire balance to Alpha V2 Lending Box
             IAlphaV2(aBox).deposit(underlyingBalance);
         }
@@ -160,13 +179,13 @@ contract AlphaV2LendingStrategyBase is IStrategy {
     /**
      * The hard work only invests all underlying assets
      */
-    function doHardWork() public override onlyFundOrGovernance {
-        investAllUnderlying();
+    function doHardWork() external override onlyFundOrGovernance {
+        _investAllUnderlying();
     }
 
     // no tokens apart from underlying should be sent to this contract. Any tokens that are sent here by mistake are recoverable by governance
     function sweep(address _token, address _sweepTo) external {
-        require(governance() == msg.sender, "Not governance");
+        require(_governance() == msg.sender, "Not governance");
         require(!canNotSweep[_token], "Token is restricted");
         IERC20(_token).safeTransfer(
             _sweepTo,
@@ -174,15 +193,47 @@ contract AlphaV2LendingStrategyBase is IStrategy {
         );
     }
 
+    function _getPath(address _from, address _to) internal pure returns (address[] memory) {
+        address[] memory path;
+        if (_from == WETH || _to == WETH) {
+            path = new address[](2);
+            path[0] = _from;
+            path[1] = _to;
+        } else {
+            path = new address[](3);
+            path[0] = _from;
+            path[1] = WETH;
+            path[2] = _to;
+        }
+        return path;
+    }
+
+    function _liquidateRewardsAndReinvest() internal {
+        uint256 rewardAmount = IERC20(rewardToken).balanceOf(address(this));
+        if (rewardAmount != 0) {
+            IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(_uniswapRouter);
+            address[] memory path = _getPath(rewardToken, underlying);
+            uint256 underlyingAmountOut = uniswapRouter.getAmountsOut(rewardAmount, path)[path.length - 1];
+            if (underlyingAmountOut != 0) {
+                IERC20(rewardToken).safeApprove(_uniswapRouter, rewardAmount);
+                uniswapRouter.swapExactTokensForTokens(rewardAmount, 1, path, address(this), now + 30);
+                _investAllUnderlying();
+            }
+        }
+    }
+
+
     /**
-     * Keeping this here as I did not find how to get totalReward
+     * This liquidates all the reward token in this strategy. 
+     * This doesn't claim the rewards, they need to be claimed separately.
      */
-    function claim(uint256 totalReward, bytes32[] memory proof)
+    function liquidateRewardsAndReinvest()
         external
         onlyFundOrGovernance
     {
-        IAlphaV2(aBox).claim(totalReward, proof);
+        _liquidateRewardsAndReinvest();
     }
+
 
     /**
      * Returns the underlying invested balance. This is the underlying amount based on yield bearing token balance,
@@ -195,7 +246,6 @@ contract AlphaV2LendingStrategyBase is IStrategy {
         returns (uint256)
     {
         uint256 shares = IERC20(aBox).balanceOf(address(this));
-        address cToken = IAlphaV2(aBox).cToken();
         uint256 exchangeRate = ICErc20(cToken).exchangeRateStored();
         uint256 precision = 10**18;
         uint256 underlyingBalanceinABox =
@@ -209,14 +259,14 @@ contract AlphaV2LendingStrategyBase is IStrategy {
     /**
      * Returns the value of the underlying token in aBox ibToken
      */
-    function shareValueFromUnderlying(uint256 underlyingAmount)
+    function _shareValueFromUnderlying(uint256 underlyingAmount)
         internal
         view
         returns (uint256)
     {
         return
             underlyingAmount.mul(10**18).div(
-                ICErc20(IAlphaV2(aBox).cToken()).exchangeRateStored()
+                ICErc20(cToken).exchangeRateStored()
             );
     }
 }
